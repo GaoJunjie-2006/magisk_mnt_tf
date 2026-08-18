@@ -81,11 +81,17 @@ src Android/obb/com.x /path/override # 该映射的源覆盖
 | 私有映射被拒(提示文件系统) | 只支持 ext4/exfat 卡;并确保 SELinux permissive |
 | 私有映射提示「卡损坏」 | 卡是 ext4:Android 不认 ext4 可移动卡,请格式化回 exfat 使用 |
 | 私有目录复制报 `Invalid argument` | exfat 不支持尾点/非法文件名(如 `psk.key.`),改映射更细粒度子目录(如 `files/public`) |
+| 移动数据失败 | exfat 硬限制:文件名不能含冒号 `:`(抖音 offlineX 487MB 因此无法搬)、尾点(微信 `psk.key.`)、**不支持符号链接**(含 symlink 的目录已自动拒绝)。这类目录无法整体迁移,改映射无特殊字符的子目录 |
+| 抖音/快手等离线包目录搬不了 | 它们的资源目录(offlineX/keva 等)文件名大量含 `:`,exfat 放不下,属正常限制,非模块故障 |
 | root 无法 `ls` 私有挂载点 | 正常:挂载点属主是应用(权限 `drwxrwx--x`),其他进程含 root 只能进入不能列表,防其他 app 窥探;应用本身(属主)读写不受影响 |
 | exfat 权限报错 | 引擎切回 `bindfs` |
 | 挂载失败 | 确认 TF 已挂载、路径存在,看 boot.log |
 
 ## 更新日志
+
+### v1.11
+- 修复:数据移动遇到含**符号链接**的目录会被 `cp -r` 展开成实体(exfat 无 symlink,抖音 Pitaya 实测 57MB→440MB 膨胀)。已改为复制前检测 symlink 并拒绝,提示映射更细粒度子目录
+- 真机确认 exfat 硬限制:文件名不能含冒号 `:`(抖音 offlineX 487MB 因此无法搬)、尾点(微信 `psk.key.`);H5 离线包类目录常含冒号文件名,迁移前可先看目标目录有无特殊字符
 
 ### v1.10
 - 修复:**私有映射取消 ext4 强制,兼容 exfat 卡**。真机实测 Android vold 把 ext4 可移动卡判为「已损坏」且不挂载——ext4 路线在系统层面走不通,改为 exfat 可用(依赖 permissive + bindfs app 属主,跳过 chcon)

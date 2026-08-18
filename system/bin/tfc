@@ -250,6 +250,12 @@ move_tree() { # src_int dst_sd
   local src=$1 dst=$2
   [ -z "$(ls -A "$src" 2>/dev/null)" ] && return 0
   [ -n "$(ls -A "$dst" 2>/dev/null)" ] && { warn "SD 目标非空，跳过移动: $dst"; return 2; }
+  # exfat 不支持符号链接(symlink=0): cp -a 失败后回退 cp -r 会把链接展开成实体,
+  # 导致数据膨胀、目录结构改变(抖音 Pitaya 实测 57MB→440MB)。含 symlink 直接拒绝。
+  if find "$src" -type l -print -quit 2>/dev/null | grep -q .; then
+    err "目录含符号链接, exfat 无法保真迁移(会展开成实体): $src。请映射更细粒度的子目录"
+    return 1
+  fi
   mkdir -p "$dst"
   if cp -a "$src"/. "$dst"/ 2>/dev/null; then
     rm -rf "$src"/* "$src"/.[!.]* 2>/dev/null
