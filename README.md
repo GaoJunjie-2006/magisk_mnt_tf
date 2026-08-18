@@ -13,7 +13,7 @@ Magisk 模块:把内置 eMMC 的**应用数据**(`Android/obb`、`Android/data`�
 
 ## 安装
 
-1. 传 `tf_card_v1.8.zip` 到手机
+1. 传 `tf_card_v1.9.zip` 到手机
 2. Magisk App → 模块 → 从本地安装
 3. 重启
 
@@ -26,7 +26,8 @@ Magisk 模块:把内置 eMMC 的**应用数据**(`Android/obb`、`Android/data`�
 1. **填 token**(首次):电脑执行 `adb shell su -c 'cat /data/adb/tfcard/web_token'`,粘贴保存(localStorage 记住)。所有接口都要求 token,没有则全部拒绝。
 2. **设路径**:外置根点「探测」自动找 `/mnt/media_rw/` 最大分区;内置根默认 `/data/media/0`。保存。
 3. **扫描**:列出所有已装包,有共享数据目录的带占用大小(没有的显示 `-`,映射时自动建目录)。
-4. **映射**:选包 → 选目录(`obb` / 同时映射 both / `data` / 自定义相对路径)→ 勾选「立即搬数据」(首次建议)→ 映射。
+4. **映射**:选包 → 选目录(`obb` / 同时映射 both / `data` / **私有目录子目录** / 自定义相对路径)→ 勾选「立即搬数据」(首次建议)→ 映射。
+   - **私有目录映射**(微信/QQ 数据大头):选「私有目录子目录」填 `files`/`cache`。前置:**SELinux permissive**(设置里勾选「SELinux 置为 permissive」)+ **TF 卡 ext4**(当前 exfat 会被拒绝,提示用 DiskGenius 等格式化)。不推荐映射 `databases`/`shared_prefs`。
 5. **应用全部挂载**:重放配置;开机自动执行,无需手动。
 
 - 映射后**重启相关 App** 才生效(正在运行的已缓存路径)。
@@ -38,8 +39,10 @@ Magisk 模块:把内置 eMMC 的**应用数据**(`Android/obb`、`Android/data`�
 tfc status                          # 状态
 tfc scan                            # 扫描(JSON)
 tfc detect                          # 探测路径
-tfc map <pkg> <obb|data|custom|both> [rel] [--move] [--src <path>]
-tfc unmap <pkg> <obb|data|custom|both> [rel] [--restore]
+tfc map <pkg> <obb|data|custom|priv|both> [rel] [--move] [--src <path>]
+tfc unmap <pkg> <obb|data|custom|priv|both> [rel] [--restore]
+# 私有目录(需 permissive + ext4 卡):
+# tfc map com.tencent.mm priv files --move
 tfc apply                           # 应用全部映射
 tfc serve                           # 启动 Web
 tfc token                           # 显示/生成 token
@@ -59,6 +62,7 @@ permissive=0                         # 1=开机 setenforce 0(排查用)
 map com.tencent.gameA obb            # 映射 obb
 map com.example.app both             # 同时映射 obb + data(两条独立行)
 map com.x custom Android/data/com.x/files
+map com.tencent.mm priv files        # 私有目录子目录(需 permissive + ext4)
 src Android/obb/com.x /path/override # 该映射的源覆盖
 ```
 
@@ -74,10 +78,18 @@ src Android/obb/com.x /path/override # 该映射的源覆盖
 |---|---|
 | Web 打不开 | `su -c 'cat /data/adb/tfcard/logs/boot.log'`;确认 httpd 在监听 8266 |
 | 映射后 App 还是旧数据 | 重启该 App |
+| 私有映射被拒(提示 ext4) | TF 卡非 ext4:用 DiskGenius 等格式化为 ext4;并确保 SELinux permissive |
 | exfat 权限报错 | 引擎切回 `bindfs` |
 | 挂载失败 | 确认 TF 已挂载、路径存在,看 boot.log |
 
 ## 更新日志
+
+### v1.9
+- 新增:**私有目录映射**(应用数据大头,微信 768MB / QQ 222MB 在 `/data/user/0`):`tfc map <pkg> priv <files|cache>`
+- 前置条件(用户决策):**SELinux permissive** + **TF 卡 ext4**(否则拒绝并提示用 DiskGenius 格式化);exfat 无 xattr,chcon/属主无法恢复
+- 实现:bindfs 以 app 自己的 uid/gid 挂载(非 root:9997),双视图覆盖 `/data/user/0` 与 `/data/data`,挂载前给 TF 源打上 app 的 SELinux 上下文,迁移前自动 force-stop 应用
+- Web 界面新增「私有目录子目录」选项与子目录输入框
+- 不推荐映射 `databases`/`shared_prefs`(高频随机 IO + 配置)
 
 ### v1.8
 - 修复:映射目标目录不存在的包(新包、无共享数据目录的包如微信 obb)挂载失败——底层视图被 `[ -d ]` 提前过滤,已改为底层视图自动建目录并强制挂载

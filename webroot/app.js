@@ -69,6 +69,9 @@ async function loadStatus() {
         // 从挂载点 dst 推导相对路径，例如 /data/media/0/Android/obb/com.x -> Android/obb/com.x
         const rel = (m.dst.match(/Android\/(obb|data)\/[^/]+/) || [""])[0];
         if (rel) MAPPED_RELS.add(rel);
+        // 私有目录挂载点 /data/user/0/<pkg>/<sub> -> priv/<pkg>/<sub>
+        const priv = (m.dst.match(/\/data\/user\/0\/([^/]+)\/([^/]+)/) || null);
+        if (priv) MAPPED_RELS.add("priv/" + priv[1] + "/" + priv[2]);
       }
     }
     $("stMounted").textContent = MOUNTS.filter((m) => m.ok).length;
@@ -113,7 +116,8 @@ function renderTable() {
     const total = p.obb + p.data;
     const obbMapped = MAPPED_RELS.has("Android/obb/" + p.pkg);
     const dataMapped = MAPPED_RELS.has("Android/data/" + p.pkg);
-    const mapped = obbMapped || dataMapped;
+    const privMapped = [...MAPPED_RELS].some((r) => r.startsWith("priv/" + p.pkg + "/"));
+    const mapped = obbMapped || dataMapped || privMapped;
     const tr = document.createElement("tr");
     tr.className = "rowpkg" + (selectedPkg === p.pkg ? " sel" : "");
     tr.innerHTML =
@@ -121,6 +125,7 @@ function renderTable() {
       "<td><b>" + esc(p.pkg) + "</b>" +
       (obbMapped ? " <span class='badge mapped'>obb</span>" : "") +
       (dataMapped ? " <span class='badge mapped'>data</span>" : "") +
+      (privMapped ? " <span class='badge mapped'>priv</span>" : "") +
       "</td>" +
       "<td class='num'>" + (p.obb > 0 ? fmt(p.obb) : "-") + "</td>" +
       "<td class='num'>" + (p.data > 0 ? fmt(p.data) : "-") + "</td>" +
@@ -152,21 +157,28 @@ function selectPkg(pkg, p) {
 }
 
 function toggleCustom() {
-  $("rowCustom").style.display = $("inDir").value === "custom" ? "" : "none";
+  const d = $("inDir").value;
+  $("rowCustom").style.display = d === "custom" ? "" : "none";
+  $("rowPriv").style.display = d === "priv" ? "" : "none";
 }
 
 /* ---------- 操作 ---------- */
 async function doMap() {
   if (!selectedPkg) { log("请先在表格中选择一个包", "err"); return; }
   const dir = $("inDir").value;
-  const custom = dir === "custom" ? $("inCustom").value.trim() : "";
+  let custom = "";
+  if (dir === "custom") custom = $("inCustom").value.trim();
+  if (dir === "priv") custom = $("inPrivSub").value.trim();
   if (dir === "custom" && !custom) { log("自定义路径不能为空", "err"); return; }
+  if (dir === "priv" && !custom) { log("私有子目录不能为空（如 files / cache）", "err"); return; }
   const move = $("inMove").checked;
   const src = $("inSrc").value.trim();
   const params = { pkg: selectedPkg, dir, move: move ? 1 : 0 };
   if (custom) params.custom = custom;
   if (src) params.src = src;
-  const relDesc = dir === "both" ? "obb + data" : (dir === "custom" ? custom : "Android/" + dir + "/" + selectedPkg);
+  const relDesc = dir === "both" ? "obb + data"
+    : (dir === "priv" ? "私有目录 /" + custom
+      : (dir === "custom" ? custom : "Android/" + dir + "/" + selectedPkg));
   if (move && !confirm("将执行：\n1) 把 " + relDesc + " 的数据移动到 TF 卡\n2) bind 挂载 TF 卡目录到原位置\n\n移动后原 eMMC 数据会被清空（已复制到 TF）。继续？")) return;
   busyOn();
   try {
@@ -181,7 +193,10 @@ async function doMap() {
 async function doUnmap(restore) {
   if (!selectedPkg) { log("请先选择包", "err"); return; }
   const dir = $("inDir").value;
-  const custom = dir === "custom" ? $("inCustom").value.trim() : "";
+  let custom = "";
+  if (dir === "custom") custom = $("inCustom").value.trim();
+  if (dir === "priv") custom = $("inPrivSub").value.trim();
+  if ((dir === "custom" || dir === "priv") && !custom) { log("请填写子目录/相对路径后再取消映射", "err"); return; }
   const params = { pkg: selectedPkg, dir };
   if (custom) params.custom = custom;
   if (restore && !confirm("将取消挂载并把数据从 TF 卡移回 eMMC。继续？")) return;

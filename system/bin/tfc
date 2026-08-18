@@ -75,7 +75,7 @@ setup_dirs() {
 #   intsd=/data/media/0                # 自定义内置根
 #   bind_engine=auto|bindfs|mount      # 挂载引擎
 #   permissive=0|1                     # 是否 setenforce 0
-#   map <pkg> <obb|data|custom> [rel]  # 高层映射条目
+#   map <pkg> <obb|data|custom|priv> [rel]  # 高层映射条目(priv 时 rel=私有子目录,需 permissive + ext4 卡)
 #   bind_mount <src> <dst>             # 原始 bind 条目（高级）
 #   # 注释
 config_get() {
@@ -152,10 +152,19 @@ resolve_base() { # 设置 EXTSD / INTSD
   return 0
 }
 
+extsd_fs() { # 外置卡文件系统类型(私有目录映射强制 ext4: 才有 xattr/SELinux, chcon/cp -a 才能生效)
+  awk -v d="$EXTSD" '$2==d{print $3}' /proc/mounts 2>/dev/null
+}
+
+is_permissive() { # SELinux 是否 Permissive(私有目录映射依赖, 挂载后才有 chcon 恢复上下文的机会)
+  [ "$(getenforce)" = Permissive ]
+}
+
 rel_for() { # pkg dir custom
   case "$2" in
     obb)    echo "Android/obb/$1";;
     data)   echo "Android/data/$1";;
+    priv)   echo "data/user/0/$1/${3%/}";;   # 私有目录子目录(数据大头,需 permissive+ext4)
     custom) echo "${3%/}";;
     *)      echo "";;
   esac
@@ -178,6 +187,25 @@ mount_one() { # src dst -> 0 on success
       --chown-ignore --chgrp-ignore --chmod-ignore \
       "$src" "$dst" 2>/dev/null && return 0
   fi
+  mount -o bind "$src" "$dst" 2>/dev/null
+}
+
+# 私有目录挂载:bindfs 以 app 的 uid/gid 呈现(而非共享目录的 root:9997),
+# 挂载前把 app 的 SELinux 上下文(chcon)打到 TF 源目录上——ext4 才有 xattr 可写。
+# 依赖 permissive:挂载点经 bindfs --xattr-none 不设 seclabel,enforcing 下 app 读会被拒。
+mount_priv_one() { # pkg sub [dst]  (dst 默认主视图, 双视图可传 /data/data 路径)
+  local pkg=$1 sub=$2 dst=${3:-/data/user/0/$pkg/$sub}
+  local src="$EXTSD/Android/priv/$pkg/$sub" ctx="" appuid appgid
+  appuid=$(stat -c %u "/data/user/0/$pkg" 2>/dev/null)
+  appgid=$(stat -c %g "/data/user/0/$pkg" 2>/dev/null)
+  [ -n "$appuid" ] || { err "取不到 $pkg 的 uid"; return 1; }
+  ctx=$(ls -Zd "$dst" 2>/dev/null | awk '{print $1}')
+  [ -n "$ctx" ] && chcon -R "$ctx" "$src" 2>/dev/null
+  $BINDFS -o nosuid,nodev,noexec,noatime,nonempty \
+    -u "$appuid" -g "$appgid" -p a-rwx,ug+rw,ugo+X \
+    --create-with-perms=a-rwx,ug+rw,ugo+X --xattr-none \
+    --chown-ignore --chgrp-ignore --chmod-ignore \
+    "$src" "$dst" 2>/dev/null && return 0
   mount -o bind "$src" "$dst" 2>/dev/null
 }
 
@@ -306,6 +334,54 @@ do_map() { # pkg dir custom move src_override
   rel=$(rel_for "$pkg" "$dir" "$custom")
   [ -z "$rel" ] && { err "非法 dir: $dir"; return 1; }
   resolve_base || return 1
+
+  # === 私有目录映射分支（应用数据大头,如微信 files 313M）===
+  # 与共享目录本质不同: 属主必须呈现为 app 自己的 uid/gid(bindfs -u appuid),
+  # 且 /data/data/<pkg> 是真实目录(非 symlink), 需双视图挂载。
+  # 前置条件(用户决策): SELinux permissive + TF 卡 ext4(才有 xattr 可写 chcon)。
+  if [ "$dir" = priv ]; then
+    local fs="" sub="" src="" dst="" dst2="" line=""
+    # 参数校验最先(不依赖环境), 再查 SELinux / 卡类型 / 目录存在
+    sub=${custom%/}; sub=${sub#/}
+    [ -n "$sub" ] || { err "私有映射需指定子目录(如 files / cache / databases 前的数据大头)"; return 1; }
+    [ "$(getenforce)" = Permissive ] || { err "私有映射需 SELinux permissive (setenforce 0)"; return 1; }
+    fs=$(extsd_fs)
+    [ "$fs" = ext4 ] || { err "私有映射需 ext4 卡(当前: ${fs:-未识别})——请用 DiskGenius 等工具把 TF 卡格式化为 ext4"; return 1; }
+    [ -d "/data/user/0/$pkg" ] || { err "私有目录不存在: /data/user/0/$pkg"; return 1; }
+    src="$EXTSD/Android/priv/$pkg/$sub"
+    dst="/data/user/0/$pkg/$sub"
+    dst2="/data/data/$pkg/$sub"
+    mkdir -p "$src" "$dst" "$dst2" 2>/dev/null
+    if [ "$move" = 1 ] && [ -d "$dst" ]; then
+      # 迁移运行中的应用数据前必须 force-stop, 否则正在写入的文件会复制到一半
+      am force-stop "$pkg" 2>/dev/null
+      move_tree "$dst" "$src"
+      # 0=已移动/源空 2=TF 目标非空跳过 1=复制失败已回滚(必须中止)
+      if [ $? = 1 ]; then
+        err "数据移动失败，中止映射（数据仍在 eMMC）: $src"
+        return 1
+      fi
+    fi
+    # 主视图 /data/user/0/<pkg>/<sub>
+    if ! mount_priv_one "$pkg" "$sub"; then
+      err "私有挂载失败: $src -> $dst"
+      return 1
+    fi
+    echo "$src $dst" >> $STATE/mounts.txt
+    # 双视图 /data/data/<pkg>/<sub>(仅当真实目录; symlink 则同 inode 无需再挂)
+    if [ -e "$dst2" ] && [ ! -L "$dst2" ]; then
+      if mount_priv_one "$pkg" "$sub" "$dst2"; then
+        echo "$src $dst2" >> $STATE/mounts.txt
+      else
+        warn "双视图 /data/data 挂载失败(主视图可用, 部分场景需重启应用)"
+      fi
+    fi
+    line="map $pkg priv $sub"
+    grep -qxF "$line" $CONFIG 2>/dev/null || config_add_line "$line"
+    info "已映射 $pkg 私有目录 ($sub) -> $src"
+    return 0
+  fi
+
   # M3：--src 只影响这一个 rel，先持久化为独立 `src <rel> <path>` 记录，
   # 再据此解析本次挂载源；apply_config 重放时也会用同一记录。
   if [ -n "$src_override" ]; then
@@ -342,6 +418,38 @@ do_unmap() { # pkg dir custom restore
   rel=$(rel_for "$pkg" "$dir" "$custom")
   [ -z "$rel" ] && { err "非法 dir: $dir"; return 1; }
   resolve_base || return 1
+
+  # === 私有目录取消映射分支 ===
+  if [ "$dir" = priv ]; then
+    local sub="" src="" dst="" dst2=""
+    sub=${custom%/}; sub=${sub#/}
+    [ -n "$sub" ] || { err "私有取消映射需指定子目录"; return 1; }
+    src="$EXTSD/Android/priv/$pkg/$sub"
+    dst="/data/user/0/$pkg/$sub"
+    dst2="/data/data/$pkg/$sub"
+    # 先解挂主视图 + 双视图, 再谈移回(eMMC 真实目录此时才可写)
+    is_mounted "$dst" && unmount_one "$dst"
+    if [ -e "$dst2" ] && [ ! -L "$dst2" ]; then
+      is_mounted "$dst2" && unmount_one "$dst2"
+    fi
+    sed -i "\| $dst$|d" $STATE/mounts.txt 2>/dev/null
+    sed -i "\| $dst2$|d" $STATE/mounts.txt 2>/dev/null
+    if [ "$restore" = 1 ]; then
+      am force-stop "$pkg" 2>/dev/null
+      if [ -d "$src" ]; then
+        move_back_tree "$src" "$dst"
+        mc=$?
+        if [ "$mc" != 0 ]; then
+          warn "数据移回失败（rc=$mc），保留映射配置；可在 Web 界面重试"
+          return 1
+        fi
+      fi
+    fi
+    config_del_map "$pkg" priv "$sub"
+    info "已取消映射 $pkg 私有目录 ($sub)"
+    return 0
+  fi
+
   unbind_all_views "$rel"
   if [ "$restore" = 1 ]; then
     src=$(config_src_get "$rel")
@@ -709,7 +817,7 @@ main() {
             shift;;
         esac
       done
-      [ -z "$pkg" ] || [ -z "$dir" ] && { err "用法: tfc map <pkg> <obb|data|custom|both> [relpath] [--move] [--src <sd>]"; return 1; }
+      [ -z "$pkg" ] || [ -z "$dir" ] && { err "用法: tfc map <pkg> <obb|data|custom|priv|both> [relpath] [--move] [--src <sd>]"; return 1; }
       if [ "$dir" = both ]; then
         do_map_both "$pkg" "$move" "$src"
       else
@@ -728,7 +836,7 @@ main() {
             shift;;
         esac
       done
-      [ -z "$pkg" ] || [ -z "$dir" ] && { err "用法: tfc unmap <pkg> <obb|data|custom|both> [relpath] [--restore]"; return 1; }
+      [ -z "$pkg" ] || [ -z "$dir" ] && { err "用法: tfc unmap <pkg> <obb|data|custom|priv|both> [relpath] [--restore]"; return 1; }
       if [ "$dir" = both ]; then
         do_unmap_both "$pkg" "$restore"
       else
