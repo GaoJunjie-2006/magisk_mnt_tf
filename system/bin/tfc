@@ -189,7 +189,11 @@ bind_all_views() { # src_sd rel -> 0=至少一个成功，或全部已挂载（�
   for base in "$INTSD" /mnt/runtime/write/emulated/0 /mnt/runtime/default/emulated/0 /mnt/runtime/read/emulated/0 /mnt/user/0/emulated/0 /storage/emulated/0; do
     dst="$base/$rel"
     [ "$dst" = "$src" ] && continue
-    [ -d "$dst" ] || continue
+    # 底层视图(INTSD)不检查目录存在性:目标目录不存在时 mount_one 会自动 mkdir 并挂载。
+    # 若提前用 [ -d ] 过滤,新包/无共享数据目录的包(如微信 obb、从未写过的 data 目录)
+    # 会连底层视图都跳过、报"挂载失败"——曾导致 jktech.bms 与微信 obb 映射失败。
+    # 其它运行时视图随底层自动显示,仍只挂已存在的目录。
+    [ "$base" = "$INTSD" ] || [ -d "$dst" ] || continue
     is_mounted "$dst" && { already=1; continue; }
     mount_one "$src" "$dst" && { echo "$src $dst" >> $STATE/mounts.txt; done=1; }
   done

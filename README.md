@@ -13,7 +13,7 @@ Magisk 模块:把内置 eMMC 的**应用数据**(`Android/obb`、`Android/data`�
 
 ## 安装
 
-1. 传 `tf_card_v1.7.zip` 到手机
+1. 传 `tf_card_v1.8.zip` 到手机
 2. Magisk App → 模块 → 从本地安装
 3. 重启
 
@@ -78,6 +78,9 @@ src Android/obb/com.x /path/override # 该映射的源覆盖
 | 挂载失败 | 确认 TF 已挂载、路径存在,看 boot.log |
 
 ## 更新日志
+
+### v1.8
+- 修复:映射目标目录不存在的包(新包、无共享数据目录的包如微信 obb)挂载失败——底层视图被 `[ -d ]` 提前过滤,已改为底层视图自动建目录并强制挂载
 
 ### v1.7
 - 修复:重启后映射静默失败(apply_config 读取 map 行字段错位,已改占位符跳过)
