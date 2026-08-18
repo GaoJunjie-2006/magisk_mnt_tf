@@ -1,0 +1,173 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>TF Card Mapper</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Crect x='10' y='10' width='80' height='80' rx='12' fill='%233b82f6'/%3E%3Crect x='28' y='28' width='44' height='44' rx='6' fill='%23fff'/%3E%3Crect x='28' y='62' width='44' height='6' fill='%23fff'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header>
+  <div class="brand">
+    <div class="logo">💾</div>
+    <div>
+      <h1>TF Card Mapper</h1>
+      <p class="sub">把 eMMC 应用数据映射到 TF 卡 · 本地管理界面</p>
+    </div>
+  </div>
+  <div class="top-status">
+    <span id="connPill" class="pill">连接中…</span>
+    <span id="selinuxPill" class="pill dim">SELinux: -</span>
+  </div>
+</header>
+
+<main>
+  <!-- 访问令牌（首次使用必需） -->
+  <section class="card" id="tokenCard">
+    <h2>访问令牌 <small>首次使用必需</small></h2>
+    <div class="field row">
+      <div class="half">
+        <label for="inToken">Web API Token</label>
+        <input id="inToken" type="password" placeholder="粘贴 token 后保存" autocomplete="off">
+      </div>
+      <div class="half">
+        <button id="btnToken" class="btn primary">保存令牌</button>
+        <p class="hint" id="tokenHint">获取方式（二选一，电脑上 adb 执行）：<br>
+        <code>adb shell su -c 'cat /data/adb/tfcard/web_token'</code><br>
+        <code>adb shell cat /data/adb/tfcard/logs/boot.log | grep WEB_TOKEN</code><br>
+        把输出的 16 位随机串粘贴到左边并「保存令牌」（浏览器 localStorage 记住，只需一次）。</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- 状态卡片 -->
+  <section class="card" id="statusCard">
+    <h2>状态</h2>
+    <div class="kv-grid" id="statusGrid">
+      <div><span class="k">内置根 (eMMC)</span><span class="v" id="stIntsd">-</span></div>
+      <div><span class="k">外置根 (TF)</span><span class="v" id="stExtsd">-</span></div>
+      <div><span class="k">挂载引擎</span><span class="v" id="stEngine">-</span></div>
+      <div><span class="k">已挂载</span><span class="v" id="stMounted">0</span></div>
+    </div>
+    <div class="row">
+      <button id="btnApply" class="btn primary">应用全部挂载</button>
+      <button id="btnRefresh" class="btn">刷新状态</button>
+      <span class="hint">提示：挂载对已运行的 App 不生效，映射后请重启相关 App。</span>
+    </div>
+  </section>
+
+  <!-- 路径与设置 -->
+  <section class="card">
+    <h2>路径设置 <small>可自定义</small></h2>
+    <div class="field">
+      <label for="inExtsd">外置 TF 卡根路径</label>
+      <div class="row">
+        <input id="inExtsd" type="text" placeholder="/mnt/media_rw/XXXX-XXXX">
+        <button id="btnDetect" class="btn" title="自动探测外置 SD">探测</button>
+      </div>
+      <p class="hint">留空 = 自动探测（/mnt/media_rw 下容量最大的分区）。也可填 /storage/XXXX-XXXX。</p>
+    </div>
+    <div class="field">
+      <label for="inIntsd">内置 eMMC 根路径</label>
+      <input id="inIntsd" type="text" placeholder="/data/media/0">
+      <p class="hint">一般保持默认 /data/media/0（Android 11+ 原始层）。</p>
+    </div>
+    <div class="field row">
+      <div class="half">
+        <label for="inEngine">挂载引擎</label>
+        <select id="inEngine">
+          <option value="auto">auto（bindfs 优先，回退 mount --bind）</option>
+          <option value="bindfs">bindfs（FUSE，权限最友好）</option>
+          <option value="mount">mount --bind（最简）</option>
+        </select>
+      </div>
+      <div class="half">
+        <label class="chk"><input type="checkbox" id="inPermissive"> SELinux 置为 permissive（仅排查时勾选）</label>
+      </div>
+    </div>
+    <div class="row">
+      <button id="btnSaveCfg" class="btn primary">保存路径设置</button>
+    </div>
+  </section>
+
+  <!-- 包列表 -->
+  <section class="card">
+    <div class="row between">
+      <h2>已安装 App <small>所有已装包，有数据目录的带大小</small></h2>
+      <div class="row">
+        <input id="inSearch" type="search" placeholder="搜索包名…">
+        <button id="btnScan" class="btn primary">扫描</button>
+      </div>
+    </div>
+    <div id="scanMeta" class="hint"></div>
+    <table id="pkgTable">
+      <thead>
+        <tr>
+          <th class="sel"></th>
+          <th>包名</th>
+          <th class="num">OBB</th>
+          <th class="num">Android/data</th>
+          <th class="num">合计</th>
+          <th>状态</th>
+          <th class="op">操作</th>
+        </tr>
+      </thead>
+      <tbody id="pkgBody"><tr><td colspan="7" class="empty">点击“扫描”开始遍历系统包…</td></tr></tbody>
+    </table>
+  </section>
+
+  <!-- 操作面板 -->
+  <section class="card" id="opCard">
+    <h2>映射操作</h2>
+    <p class="hint">选中上方表格中的包后，在此配置映射。默认映射 <b>Android/obb/包名</b> 到外置卡（App 数据大小最主要的占用者）。</p>
+    <div class="field row">
+      <div class="half">
+        <label>当前选中包</label>
+        <input id="opPkg" type="text" readonly placeholder="未选择">
+      </div>
+      <div class="half">
+        <label for="inDir">映射目录类型</label>
+        <select id="inDir">
+          <option value="obb">Android/obb/包名（推荐，游戏数据）</option>
+          <option value="both">同时映射 obb + data（一次搞定）</option>
+          <option value="data">Android/data/包名（App 数据，较激进）</option>
+          <option value="custom">自定义相对路径</option>
+        </select>
+      </div>
+    </div>
+    <div class="field" id="rowCustom" style="display:none">
+      <label for="inCustom">自定义相对路径（相对内置根）</label>
+      <input id="inCustom" type="text" placeholder="Android/data/com.example.app/files">
+      <p class="hint">例如把某个大目录单独移到 TF 卡。</p>
+    </div>
+    <div class="field row">
+      <div class="half">
+        <label for="inSrc">源路径覆盖（可选）</label>
+        <input id="inSrc" type="text" placeholder="留空 = 自动 &lt;外置根&gt;/&lt;相对路径&gt;">
+      </div>
+      <div class="half">
+        <label class="chk"><input type="checkbox" id="inMove"> 立即把数据从 eMMC 移动到 TF 卡</label>
+        <p class="hint">不勾选则仅挂载（TF 上需已有数据）。移动不可逆，重要数据请先备份。</p>
+      </div>
+    </div>
+    <div class="row">
+      <button id="btnMap" class="btn primary">映射</button>
+      <button id="btnUnmap" class="btn warn">取消映射</button>
+      <button id="btnRestore" class="btn">取消映射并移回数据</button>
+    </div>
+  </section>
+
+  <!-- 日志 -->
+  <section class="card">
+    <h2>操作日志</h2>
+    <pre id="log" class="log">等待操作…</pre>
+  </section>
+</main>
+
+<footer>
+  <p>TF Card Mapper · 仅监听 127.0.0.1 · 数据永不离开本机</p>
+</footer>
+<script src="app.js"></script>
+</body>
+</html>

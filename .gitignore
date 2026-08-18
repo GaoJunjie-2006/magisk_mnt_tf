@@ -1,0 +1,3 @@
+# 构建产物（发 release 用，不进 git）
+*.zip
+_build/

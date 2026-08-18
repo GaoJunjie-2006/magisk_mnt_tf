@@ -1,0 +1,772 @@
+#!/system/bin/sh
+# ============================================================
+#  TF Card Mapper (tf_card) — 把 eMMC 应用数据映射到 TF 卡
+#  Magisk 模块核心引擎
+#
+#  设计要点：
+#   - 纯 POSIX sh（Android mksh），零 bashism
+#   - 数据放在 /data/adb/tfcard（模块更新不丢配置）
+#   - 挂载优先 bindfs（FUSE，权限友好），回退 mount --bind
+#   - 多视图挂载：/data/media/0 底层 + /mnt/runtime/write 等运行时视图
+#   - 同时作为 Web 前端（busybox httpd + CGI）的后端 API
+#
+#  用法:
+#   tfc boot                        开机: 等存储就绪 -> apply -> serve
+#   tfc apply                       应用 config.txt 全部映射
+#   tfc status                      挂载状态(文本)
+#   tfc scan                        扫描有数据目录的包(JSON)
+#   tfc detect                      探测外置/内置路径(JSON)
+#   tfc map <pkg> <obb|data|custom> [relpath] [--move] [--src <sd>]
+#   tfc unmap <pkg> <obb|data|custom> [relpath] [--restore]
+#   tfc serve                       启动 Web 服务
+#   tfc web                         处理一条 CGI 请求(被 api.cgi 调用)
+#   tfc config get|set <k> [v]
+#   tfc uninstall_all               卸载时解除全部挂载
+# ============================================================
+
+MODDIR=/data/adb/modules/tfcard
+DATADIR=/data/adb/tfcard
+LOGDIR=$DATADIR/logs
+CONFIG=$DATADIR/config.txt
+STATE=$DATADIR/state
+BIN=$MODDIR/bin
+WEBROOT=$MODDIR/webroot
+PORT_FILE=$DATADIR/port
+TOKEN_FILE=$DATADIR/web_token
+DEFAULT_PORT=8266
+
+# ---------- 基础工具 ----------
+# 日志统一带时间戳，输出到 stdout 的同时追加到 app.log：
+#  - boot 时 service.sh 把 stdout 重定向到 boot.log（可快速看启动）
+#  - app.log 累积所有来源（开机 + Web 操作 + CLI）的记录，是排查的主日志
+LOGFILE=$DATADIR/logs/app.log
+stamp() { date +%H:%M:%S 2>/dev/null || echo "--:--:--"; }
+info() { echo "[$(stamp)] [i] $*" | tee -a "$LOGFILE"; }
+warn() { echo "[$(stamp)] [w] $*" | tee -a "$LOGFILE"; }
+err()  { echo "[$(stamp)] [e] $*" | tee -a "$LOGFILE" >&2; }
+
+# busybox 位置
+BB=
+[ -x $BIN/busybox ] && BB=$BIN/busybox
+BINDFS=
+[ -x $BIN/bindfs ] && BINDFS=$BIN/bindfs
+
+# 端口 / token
+PORT=$DEFAULT_PORT
+[ -f $PORT_FILE ] && PORT=$(cat $PORT_FILE 2>/dev/null)
+TOKEN=
+[ -f $TOKEN_FILE ] && TOKEN=$(cat $TOKEN_FILE 2>/dev/null)
+
+is_mounted() { mountpoint -q "$1" 2>/dev/null; }
+
+root_check() {
+  [ "$(id -u)" = 0 ] || { err "必须以 root 运行 (su)"; exit 1; }
+}
+
+setup_dirs() {
+  mkdir -p $DATADIR $LOGDIR $STATE
+  chmod 700 $DATADIR 2>/dev/null   # /data/adb/tfcard 仅 root 可读，token 不泄露给普通 app
+  [ -f $CONFIG ] || touch $CONFIG
+}
+
+# ---------- 配置读写 ----------
+# config.txt 格式（每行一条）：
+#   extsd=/mnt/media_rw/XXXX-XXXX      # 自定义外置根
+#   intsd=/data/media/0                # 自定义内置根
+#   bind_engine=auto|bindfs|mount      # 挂载引擎
+#   permissive=0|1                     # 是否 setenforce 0
+#   map <pkg> <obb|data|custom> [rel]  # 高层映射条目
+#   bind_mount <src> <dst>             # 原始 bind 条目（高级）
+#   # 注释
+config_get() {
+  sed -n "s|^$1=||p" $CONFIG 2>/dev/null | tail -n1
+}
+
+config_set() { # key value
+  sed -i "/^$1=/d" $CONFIG 2>/dev/null
+  echo "$1=$2" >> $CONFIG
+}
+
+config_add_line() { echo "$*" >> $CONFIG; }
+
+config_del_map() { # pkg dir [custom]
+  # 按与 do_map 完全一致的格式（字面量精确匹配）删除 map 行，并清理对应 src 记录。
+  # 不同 custom 是不同行，M4：删一行不影响其它同包映射。
+  local pkg=$1 dir=$2 custom=${3:-} rel="" line=""
+  # 注意：不能在同一行 local 里引用 $pkg/$dir（shell 会先展开整条语句）
+  line="map $pkg $dir"
+  [ -n "$custom" ] && line="$line $custom"
+  # grep 无匹配（即全删光）时返回 1，不能依赖 && 短路，否则 map 行删不掉
+  grep -vxF "$line" $CONFIG 2>/dev/null > $CONFIG.tmp || true
+  mv -f $CONFIG.tmp $CONFIG
+  rel=$(rel_for "$pkg" "$dir" "$custom")
+  # rel 含斜杠，靠 dotre 转义为 \/，/ 地址分隔符才安全（busybox sed 已实测写坏文件）
+  [ -n "$rel" ] && sed -i "/^src $(dotre "$rel") /d" $CONFIG 2>/dev/null
+}
+
+# src 覆盖记录：`src <rel> <path>`，独立成行，避免与 map 行的 custom 字段混淆（M3）
+config_src_get() { # rel -> stdout
+  sed -n "s|^src $(dotre "$1") ||p" $CONFIG 2>/dev/null | tail -n1
+}
+
+config_src_set() { # rel path
+  sed -i "/^src $(dotre "$1") /d" $CONFIG 2>/dev/null
+  echo "src $1 $2" >> $CONFIG
+}
+
+# ---------- 路径解析 ----------
+detect_intsd() {
+  for p in /data/media/0 /mnt/runtime/write/emulated/0 /storage/emulated/0; do
+    [ -d "$p" ] && { echo "$p"; return 0; }
+  done
+  echo ""
+}
+
+detect_extsd() {
+  local best="" best_size=0 dir size
+  for dir in /mnt/media_rw/*; do
+    [ -d "$dir" ] || continue
+    is_mounted "$dir" || continue
+    size=$(df -k "$dir" 2>/dev/null | tail -n1 | awk '{print $2}')
+    [ -n "$size" ] && [ "$size" -gt "$best_size" ] 2>/dev/null && {
+      best=$dir; best_size=$size
+    }
+  done
+  echo "$best"
+}
+
+resolve_base() { # 设置 EXTSD / INTSD
+  EXTSD=$(config_get extsd)
+  INTSD=$(config_get intsd)
+  [ -z "$INTSD" ] && INTSD=$(detect_intsd)
+  [ -z "$INTSD" ] && { err "无法定位内置存储"; return 1; }
+  # 配置里的 extsd 不可用时（实测手填丢了连字符 EFFFFF52≠EFFF-FF52，
+  # 会让所有映射一起失败），自动探测真实挂载点并纠正配置。
+  [ -n "$EXTSD" ] && [ -d "$EXTSD" ] || EXTSD=""
+  if [ -z "$EXTSD" ]; then
+    EXTSD=$(detect_extsd)
+    [ -z "$EXTSD" ] && { err "未检测到外置 TF 卡 (/mnt/media_rw/)"; return 1; }
+    config_set extsd "$EXTSD"
+    info "已自动设置外置根: $EXTSD"
+  fi
+  return 0
+}
+
+rel_for() { # pkg dir custom
+  case "$2" in
+    obb)    echo "Android/obb/$1";;
+    data)   echo "Android/data/$1";;
+    custom) echo "${3%/}";;
+    *)      echo "";;
+  esac
+}
+
+# ---------- 挂载 ----------
+mount_one() { # src dst -> 0 on success
+  local src=$1 dst=$2 engine
+  mkdir -p "$dst" 2>/dev/null
+  [ -d "$src" ] || mkdir -p "$src"
+  engine=$(config_get bind_engine)
+  [ -z "$engine" ] && engine=auto
+  if [ "$engine" != mount ] && [ -n "$BINDFS" ]; then
+    # 参数对齐 fbind 实战组合：exfat 无属主/权限，固定显示 root:everybody(gid 9997)
+    # + 权限 660/770；三个 -ignore 把 chown/chmod 变 no-op（透传到 exfat 只会报错）；
+    # --create-with-perms 约束新建文件权限；--xattr-none 关掉 xattr 透传。
+    $BINDFS -o nosuid,nodev,noexec,noatime,nonempty \
+      -u 0 -g 9997 -p a-rwx,ug+rw,ugo+X \
+      --create-with-perms=a-rwx,ug+rw,ugo+X --xattr-none \
+      --chown-ignore --chgrp-ignore --chmod-ignore \
+      "$src" "$dst" 2>/dev/null && return 0
+  fi
+  mount -o bind "$src" "$dst" 2>/dev/null
+}
+
+unmount_one() { umount -f "$1" 2>/dev/null; }
+
+# 对一条映射执行全部视图挂载；返回 0=至少一个成功
+bind_all_views() { # src_sd rel -> 0=至少一个成功，或全部已挂载（幂等，L2）
+  local src=$1 rel=$2 base="" dst="" done=0 already=0
+  for base in "$INTSD" /mnt/runtime/write/emulated/0 /mnt/runtime/default/emulated/0 /mnt/runtime/read/emulated/0 /mnt/user/0/emulated/0 /storage/emulated/0; do
+    dst="$base/$rel"
+    [ "$dst" = "$src" ] && continue
+    [ -d "$dst" ] || continue
+    is_mounted "$dst" && { already=1; continue; }
+    mount_one "$src" "$dst" && { echo "$src $dst" >> $STATE/mounts.txt; done=1; }
+  done
+  [ "$done" -ge 1 ] && return 0
+  [ "$already" -ge 1 ] && return 0
+  return 1
+}
+
+unbind_all_views() { # rel
+  local rel=$1 base="" dst=""
+  for base in "$INTSD" /mnt/runtime/write/emulated/0 /mnt/runtime/default/emulated/0 /mnt/runtime/read/emulated/0 /mnt/user/0/emulated/0 /storage/emulated/0; do
+    dst="$base/$rel"
+    is_mounted "$dst" && unmount_one "$dst"
+  done
+  # 全删光时 grep 返回 1，不能依赖 && 短路（否则记录清不掉，残留成假挂载）
+  grep -vF "$rel " $STATE/mounts.txt 2>/dev/null > $STATE/mounts.txt.tmp || true
+  mv -f $STATE/mounts.txt.tmp $STATE/mounts.txt
+  return 0
+}
+
+# ---------- 数据移动 ----------
+move_tree() { # src_int dst_sd
+  local src=$1 dst=$2
+  [ -z "$(ls -A "$src" 2>/dev/null)" ] && return 0
+  [ -n "$(ls -A "$dst" 2>/dev/null)" ] && { warn "SD 目标非空，跳过移动: $dst"; return 2; }
+  mkdir -p "$dst"
+  if cp -a "$src"/. "$dst"/ 2>/dev/null; then
+    rm -rf "$src"/* "$src"/.[!.]* 2>/dev/null
+    info "已移动: $src -> $dst"
+    return 0
+  fi
+  # exfat 没有属主/权限概念，cp -a 必然失败（无法 preserve ownership/permission）。
+  # 回退 cp -r 仅复制内容——TF 卡挂载走 bindfs，权限差异已被 --chown-ignore 等兜底。
+  warn "cp -a 失败（目标可能是 exfat），回退 cp -r 仅复制内容"
+  rm -rf "$dst"/* "$dst"/.[!.]* 2>/dev/null
+  if cp -r "$src"/. "$dst"/ 2>/dev/null; then
+    rm -rf "$src"/* "$src"/.[!.]* 2>/dev/null
+    info "已移动(内容): $src -> $dst"
+    return 0
+  fi
+  rm -rf "$dst" 2>/dev/null
+  err "复制失败，已回滚，源数据保留: $src"
+  return 1
+}
+
+move_back_tree() { # src_sd dst_int
+  local src=$1 dst=$2
+  [ -z "$(ls -A "$src" 2>/dev/null)" ] && return 0
+  [ -n "$(ls -A "$dst" 2>/dev/null)" ] && { warn "内置目标非空，跳过恢复: $dst"; return 2; }
+  mkdir -p "$dst"
+  if cp -a "$src"/. "$dst"/ 2>/dev/null; then
+    rm -rf "$src"/* "$src"/.[!.]* 2>/dev/null
+    info "已移回: $src -> $dst"
+    return 0
+  else
+    rm -rf "$dst" 2>/dev/null
+    err "移回失败"
+    return 1
+  fi
+}
+
+# ---------- 包扫描 ----------
+# 直接遍历内置根下 Android/obb 与 Android/data 的目录，不依赖 pm 命令
+# （更快、更准，只列「实际存在数据」的包，与平台/权限解耦）
+dir_size() { du -sk "$1" 2>/dev/null | awk '{print $1}'; }
+
+# JSON 字符串转义：丢弃控制字符（含换行/制表，会破坏 JSON），转义 \ 与 "
+json_esc() { tr -d '\000-\037' | sed 's/\\/\\\\/g; s/"/\\"/g'; }
+
+# 把点号与斜杠转义为字面量（用于 sed 正则里的包名/相对路径）。
+# 斜杠也必须转义：rel 形如 Android/data/包名，出现在 `/regex/` 地址里，
+# 未转义的 / 会让 busybox sed 把地址截断、进而写坏整个配置文件。
+dotre() { printf '%s' "$1" | sed 's/\./\\./g; s/\//\\\//g'; }
+
+scan_pkgs() {
+  local pkg obbsz datasz first=1 d seen="" epkg
+  echo -n '{"pkgs":['
+  # 候选包 = ① 有共享数据目录的所有包（含系统包，直接遍历目录）
+  #         ∪ ② pm 列出的全部第三方已装包（没数据目录的也列出，显示 0）。
+  # 这样「所有已装 App」都能被搜到；映射无数据目录的包时，mount_one 会自动
+  # mkdir 目标目录，App 之后往 Android/data 写的东西会落到 TF 卡。
+  local cand=""
+  for d in "$INTSD"/Android/obb/*/ "$INTSD"/Android/data/*/; do
+    [ -d "$d" ] || continue
+    pkg=${d%/}; pkg=${pkg##*/}
+    [ "$pkg" = '*' ] && continue
+    cand="$cand $pkg"
+  done
+  cand="$cand $(pm list packages -3 2>/dev/null | sed 's/^package://')"
+  for pkg in $cand; do
+    [ -z "$pkg" ] && continue
+    # 去重：目录与 pm 列表可能重叠
+    case " $seen " in *" $pkg "*) continue;; esac
+    seen="$seen $pkg"
+    obbsz=0; datasz=0
+    [ -d "$INTSD/Android/obb/$pkg" ] && obbsz=$(dir_size "$INTSD/Android/obb/$pkg")
+    [ -d "$INTSD/Android/data/$pkg" ] && datasz=$(dir_size "$INTSD/Android/data/$pkg")
+    [ $first -eq 0 ] && echo -n ','
+    first=0
+    epkg=$(printf '%s' "$pkg" | json_esc)
+    echo -n "{\"pkg\":\"$epkg\",\"obb\":$obbsz,\"data\":$datasz}"
+  done
+  echo -n "],\"intsd\":\"$INTSD\",\"extsd\":\"$EXTSD\"}"
+  echo
+}
+
+# ---------- map / unmap ----------
+do_map() { # pkg dir custom move src_override
+  local pkg=$1 dir=$2 custom=${3:-} move=${4:-0} src_override=${5:-} rel="" src="" line=""
+  rel=$(rel_for "$pkg" "$dir" "$custom")
+  [ -z "$rel" ] && { err "非法 dir: $dir"; return 1; }
+  resolve_base || return 1
+  # M3：--src 只影响这一个 rel，先持久化为独立 `src <rel> <path>` 记录，
+  # 再据此解析本次挂载源；apply_config 重放时也会用同一记录。
+  if [ -n "$src_override" ]; then
+    src_override=$(echo "$src_override" | sed 's|//|/|g')
+    config_src_set "$rel" "$src_override"
+  fi
+  src=$(config_src_get "$rel")
+  [ -z "$src" ] && src="$EXTSD/$rel"
+  mkdir -p "$src"
+  if [ "$move" = 1 ] && [ -d "$INTSD/$rel" ]; then
+    move_tree "$INTSD/$rel" "$src"
+    # move_tree: 0=已移动/源空 2=SD 目标非空跳过 1=复制失败已回滚
+    # H2：复制失败必须中止，绝不能把空目录 bind 上去掩盖数据丢失
+    if [ $? = 1 ]; then
+      err "数据移动失败，中止映射（数据仍在 eMMC）: $src"
+      return 1
+    fi
+  fi
+  if bind_all_views "$src" "$rel"; then
+    line="map $pkg $dir"
+    [ -n "$custom" ] && line="$line $custom"
+    # M4：按与 config_del_map 相同的字面量格式去重；不同 custom 是不同行，互不覆盖
+    grep -qxF "$line" $CONFIG 2>/dev/null || config_add_line "$line"
+    info "已映射 $pkg ($dir) -> $src"
+    return 0
+  else
+    err "挂载失败: $src -> $INTSD/$rel"
+    return 1
+  fi
+}
+
+do_unmap() { # pkg dir custom restore
+  local pkg=$1 dir=$2 custom=${3:-} restore=${4:-0} rel="" src="" mc=""
+  rel=$(rel_for "$pkg" "$dir" "$custom")
+  [ -z "$rel" ] && { err "非法 dir: $dir"; return 1; }
+  resolve_base || return 1
+  unbind_all_views "$rel"
+  if [ "$restore" = 1 ]; then
+    src=$(config_src_get "$rel")
+    [ -z "$src" ] && src="$EXTSD/$rel"
+    if [ -d "$src" ]; then
+      move_back_tree "$src" "$INTSD/$rel"
+      mc=$?
+      if [ "$mc" != 0 ]; then
+        # M7：移回失败（目标非空/复制失败）时保留映射配置，下次 apply/开机仍会挂载，
+        # 数据不会丢在 TF 卡上不可见。
+        warn "数据移回失败（rc=$mc），保留映射配置；可在 Web 界面重试"
+        return 1
+      fi
+    fi
+  fi
+  config_del_map "$pkg" "$dir" "$custom"
+  info "已取消映射 $pkg ($dir)"
+  return 0
+}
+
+# both：一次同时映射 obb + data（写成两条独立 map 行，与分别映射完全等价，
+# 重启/apply 逐行重放天然兼容，任一失败可单独重试）
+do_map_both() { # pkg move src_override
+  local pkg=$1 move=${2:-0} src=${3:-} ok=1
+  # src 覆盖必须传给两条底层 do_map，否则 both 模式下 --src 被静默忽略
+  # （曾漏传：do_map 第 5 参硬编码 ""，Web/CLI 指定 src 时 obb/data 仍走默认路径）。
+  do_map "$pkg" obb "" "$move" "$src" || ok=0
+  do_map "$pkg" data "" "$move" "$src" || ok=0
+  if [ $ok -eq 1 ]; then info "已同时映射 $pkg (obb + data)"; return 0; fi
+  err "同时映射未完全成功（obb 与 data 独立，可单独重试）"
+  return 1
+}
+
+do_unmap_both() { # pkg restore
+  local pkg=$1 restore=${2:-0} ok=1
+  do_unmap "$pkg" obb "" "$restore" || ok=0
+  do_unmap "$pkg" data "" "$restore" || ok=0
+  if [ $ok -eq 1 ]; then info "已同时取消映射 $pkg (obb + data)"; return 0; fi
+  err "同时取消未完全成功（obb 与 data 独立，可单独重试）"
+  return 1
+}
+
+# ---------- 应用配置 ----------
+apply_config() {
+  resolve_base || { err "apply_config: 路径解析失败，中止应用"; return 1; }
+  info "  内置根=$INTSD  外置根=$EXTSD  引擎=$(config_get bind_engine)"
+  if [ "$(config_get permissive)" = 1 ]; then
+    setenforce 0 2>/dev/null && info "已 setenforce 0 (permissive)"
+  fi
+  # M5：先清理跨重启残留的挂载记录——只保留仍真实挂载的条目，
+  # 避免 mounts.txt 堆积指向已卸载目录的死记录（status 误报 MISS）。
+  if [ -f $STATE/mounts.txt ]; then
+    : > $STATE/mounts.txt.tmp
+    local s d
+    while read -r s d; do
+      is_mounted "$d" && echo "$s $d" >> $STATE/mounts.txt.tmp
+    done < $STATE/mounts.txt
+    mv $STATE/mounts.txt.tmp $STATE/mounts.txt
+  fi
+  # 用重定向（而非管道）读取，避免 while 进入子 shell——否则 mcount/bcount
+  # 在子 shell 里递增无效，日志会全部显示 #1（Android mksh 实测）。
+  local mcount=0
+  grep '^map ' $CONFIG 2>/dev/null > $STATE/apply.tmp
+  # 行格式 `map <pkg> <dir> [custom]`：read 第一个字段是字面 "map"，必须用 _ 占位跳过，
+  # 否则 pkg 会被错位成 "map"，rel_for 判定 dir 非法、映射全部失败（曾导致重启后映射不重放）。
+  while read -r _ pkg dir custom; do
+    mcount=$((mcount+1))
+    info "  应用映射 #$mcount: $pkg ($dir${custom:+ $custom})"
+    do_map "$pkg" "$dir" "$custom" 0 ""
+  done < $STATE/apply.tmp
+  local bcount=0
+  grep '^bind_mount ' $CONFIG 2>/dev/null > $STATE/apply.tmp
+  while read -r _ src dst; do
+    bcount=$((bcount+1))
+    info "  应用原始 bind #$bcount: $src -> $dst"
+    mount_one "$src" "$dst" && echo "$src $dst" >> $STATE/mounts.txt
+  done < $STATE/apply.tmp
+  rm -f $STATE/apply.tmp
+  info "  apply_config 完成"
+  return 0
+}
+
+# ---------- 状态 ----------
+status_text() {
+  resolve_base 2>/dev/null
+  echo "=== TF Card Mapper 状态 ==="
+  echo "内置根:   $INTSD"
+  echo "外置根:   $EXTSD"
+  echo "挂载引擎: $(config_get bind_engine) (bindfs=$([ -n "$BINDFS" ] && echo yes || echo no))"
+  echo "SELinux:  $(getenforce 2>/dev/null)"
+  echo
+  echo "--- 已配置映射 ---"
+  grep -E '^(map|bind_mount) ' $CONFIG 2>/dev/null || echo "(无)"
+  echo
+  echo "--- 当前挂载 ---"
+  if [ -f $STATE/mounts.txt ]; then
+    local n=0 src dst
+    while read -r src dst; do
+      if is_mounted "$dst"; then
+        echo "OK   $dst  <=  $src"
+        n=$((n+1))
+      else
+        echo "MISS $dst  <=  $src"
+      fi
+    done < $STATE/mounts.txt
+    [ $n -eq 0 ] && echo "(全部未挂载)"
+  else
+    echo "(无记录)"
+  fi
+  echo
+}
+
+status_json() {
+  resolve_base 2>/dev/null
+  echo -n "{\"intsd\":\"$INTSD\",\"extsd\":\"$EXTSD\",\"selinux\":\""
+  echo -n "$(getenforce 2>/dev/null)"
+  echo -n "\",\"engine\":\"$(config_get bind_engine)\",\"mounts\":["
+  local first=1 src dst
+  if [ -f $STATE/mounts.txt ]; then
+    while read -r src dst; do
+      [ $first -eq 0 ] && echo -n ','
+      first=0
+      if is_mounted "$dst"; then
+        echo -n "{\"dst\":\"$dst\",\"src\":\"$src\",\"ok\":true}"
+      else
+        echo -n "{\"dst\":\"$dst\",\"src\":\"$src\",\"ok\":false}"
+      fi
+    done < $STATE/mounts.txt
+  fi
+  echo -n ']}'
+  echo
+}
+
+# ---------- Web 服务 ----------
+serve() {
+  [ -n "$BB" ] || { err "busybox 不可用，无法启动 Web"; return 1; }
+  # L4：端口必须是纯数字，否则 httpd 会把非法地址当监听目标直接失败
+  case "$PORT" in ''|*[!0-9]*) PORT=$DEFAULT_PORT;; esac
+  if [ -z "$TOKEN" ]; then
+    TOKEN=$(head -c8 /dev/urandom 2>/dev/null | od -An -tx1 | tr -d ' \n')
+    echo "$TOKEN" > $TOKEN_FILE
+    chmod 600 $TOKEN_FILE 2>/dev/null
+  fi
+  echo "$PORT" > $PORT_FILE
+  # 日志直显 token：service.sh 把 stdout 重定向到 boot.log，用户一条 cat 即得
+  info "WEB_TOKEN=$TOKEN"
+  # CGI 通过标准 cgi-bin/ 目录 + shebang 执行，无需 httpd.conf（也不写，避免被
+  # 误解析成解释器映射）。注意：千万不要放 httpd.conf，`*.cgi:` 行会让 httpd
+  # 把它当解释器名去 exec，导致 404。脚本必须可执行且以 #!/system/bin/sh 开头。
+  info "Web UI: http://127.0.0.1:$PORT"
+  # httpd 不再 exec：改为 nohup 后台运行，stderr 写入 app.log——
+  # 之前 exec 时若 httpd 启动失败（如端口被占）错误无处可查，用户只见"连不上"。
+  # ⚠️ busybox 的 nohup 会 fork 子进程执行命令，`nohup cmd &` 的 $! 是 nohup
+  # 父进程的 PID，fork 完立即退出——所以**绝不能**用 kill -0 $! 判断 httpd 存活，
+  # 否则永远误报"启动失败"（httpd 其实正常监听）。改为：只以端口监听为判据。
+  # 启动前先清掉可能残留的同端口 httpd（模块升级后旧进程可能还 serve 着旧 webroot）；
+  # 正则 [h]ttpd 使 pkill 不会匹配到执行它的 shell 自身（cmdline 含字面 [h]ttpd）。
+  $BB pkill -f "[h]ttpd -p 127.0.0.1:$PORT" 2>/dev/null
+  sleep 1
+  nohup $BB httpd -p 127.0.0.1:$PORT -h "$WEBROOT" >> "$LOGFILE" 2>&1 &
+  sleep 1
+  # 校验：端口已监听即成功（幂等：重复 serve 时旧进程已被清理，新进程监听）
+  hex=$(printf '%04X' "$PORT" 2>/dev/null)
+  if grep -qi ":${hex} " /proc/net/tcp 2>/dev/null; then
+    info "httpd 已就绪 (端口 $PORT)"
+    return 0
+  fi
+  err "httpd 启动失败，具体错误见: $LOGFILE"
+  return 1
+}
+
+urldecode() { # string -> stdout
+  if [ -n "$BB" ]; then
+    $BB httpd -d "$1" 2>/dev/null
+  else
+    echo "$1"
+  fi
+}
+
+# CGI 请求处理（被 api.cgi 调用）
+web_handle() {
+  local qs="$QUERY_STRING" method="${REQUEST_METHOD:-GET}"
+  local action="" pkg="" dir="" custom="" move="" restore="" src="" body="" cl="" key="" val=""
+  local authed=0
+  if [ "$method" = POST ]; then
+    cl=${CONTENT_LENGTH:-0}
+    [ "$cl" -gt 0 ] 2>/dev/null && body=$(dd bs=1 count=$cl 2>/dev/null)
+    qs="$body"
+  fi
+  local kv k v
+  IFS='&'
+  for kv in $qs; do
+    k=${kv%%=*}; v=$(urldecode "${kv#*=}")
+    case "$k" in
+      action) action=$v;;
+      pkg) pkg=$v;;
+      dir) dir=$v;;
+      custom) custom=$v;;
+      move) move=$v;;
+      restore) restore=$v;;
+      src) src=$v;;
+      key) key=$v;;
+      val) val=$v;;
+      t) [ -n "$v" ] && [ "$v" = "$TOKEN" ] && authed=1;;
+    esac
+  done
+  unset IFS
+  # 必须用 CRLF 结束 header：busybox httpd 透传 CGI 头时不会把 LF 规范成 CRLF，
+  # 严格 HTTP 客户端（node/undici、部分代理）会拒绝 LF-only 头。
+  printf 'Content-type: application/json\r\n\r\n'
+  # H1：所有动作（含只读 status/scan/token）都必须携带有效 token。
+  # 只读放行会留后门：任意本地进程 GET ?action=token 就能拿到 token，
+  # 再拿去执行 root 级文件操作。CSRF 的防护就废了。
+  # 注意：不能只在「t 参数不匹配」时拒绝——没有 t 参数的请求也必须被拒。
+  [ "$authed" = 1 ] || { echo '{"ok":false,"error":"forbidden"}'; exit 0; }
+  case "$action" in
+    scan)
+      resolve_base 2>/dev/null; scan_pkgs
+      ;;
+    detect)
+      echo -n "{\"ok\":true,\"extsd\":\"$(detect_extsd)\",\"intsd\":\"$(detect_intsd)\"}"
+      echo
+      ;;
+    status)
+      status_json
+      ;;
+    map)
+      if [ -z "$pkg" ] || [ -z "$dir" ]; then
+        echo '{"ok":false,"error":"缺 pkg/dir"}'
+      else
+        if [ "$dir" = both ]; then
+          emsg=$(do_map_both "$pkg" "$([ "$move" = 1 ] && echo 1 || echo 0)" "$src" 2>&1)
+        else
+          emsg=$(do_map "$pkg" "$dir" "$custom" "$([ "$move" = 1 ] && echo 1 || echo 0)" "$src" 2>&1)
+        fi
+        if [ $? -eq 0 ]; then
+          echo '{"ok":true}'
+        else
+          emsg=$(printf '%s' "$emsg" | tr -d '\000-\037' | sed 's/\\/\\\\/g; s/"/\\"/g' | tail -1)
+          echo "{\"ok\":false,\"error\":\"map 失败\",\"detail\":\"$emsg\"}"
+        fi
+      fi
+      ;;
+    unmap)
+      if [ "$dir" = both ]; then
+        emsg=$(do_unmap_both "$pkg" "$([ "$restore" = 1 ] && echo 1 || echo 0)" 2>&1)
+      else
+        emsg=$(do_unmap "$pkg" "$dir" "$custom" "$([ "$restore" = 1 ] && echo 1 || echo 0)" 2>&1)
+      fi
+      if [ $? -eq 0 ]; then
+        echo '{"ok":true}'
+      else
+        emsg=$(printf '%s' "$emsg" | tr -d '\000-\037' | sed 's/\\/\\\\/g; s/"/\\"/g' | tail -1)
+        echo "{\"ok\":false,\"error\":\"unmap 失败\",\"detail\":\"$emsg\"}"
+      fi
+      ;;
+    apply)
+      apply_config 1>&2 2>/dev/null
+      status_json
+      ;;
+    setcfg)
+      # L1：只允许白名单键 + 合法值；先剥离控制字符防 config 注入
+      val=$(printf '%s' "$val" | tr -d '\000-\037')
+      key=$(printf '%s' "$key" | tr -d '\000-\037')
+      case "$key:$val" in
+        extsd:*) config_set extsd "$val";;
+        intsd:*) config_set intsd "$val";;
+        bind_engine:auto|bind_engine:bindfs|bind_engine:mount) config_set bind_engine "$val";;
+        permissive:0|permissive:1) config_set permissive "$val";;
+        *) echo -n '{"ok":false,"error":"bad key/val"}'; echo; exit 0;;
+      esac
+      echo -n "{\"ok\":true,\"key\":\"$key\",\"val\":\"$(config_get "$key")\"}"
+      echo
+      ;;
+    getcfg)
+      echo -n "{\"ok\":true,\"key\":\"$key\",\"val\":\"$(config_get "$key")\"}"
+      echo
+      ;;
+    token)
+      echo -n "{\"token\":\"$TOKEN\"}"
+      echo
+      ;;
+    *)
+      echo -n '{"ok":false,"error":"unknown action"}'
+      echo
+      ;;
+  esac
+  exit 0
+}
+
+# ---------- boot ----------
+boot() {
+  info "===== 开机启动 (boot) ====="
+  info "等待内置存储就绪..."
+  # 判断标准放宽：/storage/emulated/0 挂载后必有内容（Android/DCIM/Download…），
+  # 但 Documents 目录并非所有 ROM 都有 —— 之前死等它导致本机开机 httpd 迟迟不起。
+  local n=0
+  until [ -d /storage/emulated/0 ] && [ -n "$(ls -A /storage/emulated/0 2>/dev/null)" ]; do
+    n=$((n+1))
+    [ $((n % 10)) -eq 0 ] && info "  仍在等待内置存储（${n}x3s）..."
+    [ $n -gt 60 ] && { err "等待内置存储超时（180s），继续尝试后续步骤"; break; }
+    sleep 3
+  done
+  info "  内置存储就绪（等待 ${n}x3s）"
+  # 仅当已配置外置根时才等 TF 卡挂载；否则跳过（无卡也能进 Web 界面配置）。
+  # L3：只认「配置的目录真实挂载」；media_rw 下有内容视为卡已插入，可继续。
+  local extsd
+  extsd=$(config_get extsd)
+  if [ -n "$extsd" ]; then
+    info "等待 TF 卡就绪: $extsd"
+    n=0
+    until [ -d "$extsd" ] || [ -n "$(ls /mnt/media_rw/ 2>/dev/null)" ]; do
+      n=$((n+1))
+      [ $((n % 10)) -eq 0 ] && info "  仍在等待 TF 卡（${n}x3s）..."
+      [ $n -gt 60 ] && { err "等待 TF 卡超时（180s），继续尝试后续步骤"; break; }
+      sleep 3
+    done
+    info "  TF 卡状态：目录存在=$([ -d "$extsd" ] && echo yes || echo no)，/mnt/media_rw 有内容=$([ -n "$(ls /mnt/media_rw/ 2>/dev/null)" ] && echo yes || echo no)"
+  else
+    warn "未配置外置根（extsd 为空），跳过 TF 卡等待——无卡也能进 Web 界面配置"
+  fi
+  info "应用挂载配置（apply_config）..."
+  apply_config
+  info "启动 Web 界面（serve）..."
+  serve
+  info "===== 开机启动完成 ====="
+}
+
+# ---------- 卸载 ----------
+unbind_everything() {
+  if [ -f $STATE/mounts.txt ]; then
+    local dst
+    while read -r _ dst; do
+      unmount_one "$dst"
+    done < $STATE/mounts.txt
+    rm -f $STATE/mounts.txt
+  fi
+  [ -n "$BB" ] && pkill -f "$BB httpd" 2>/dev/null
+  return 0
+}
+
+# ---------- 主分发 ----------
+main() {
+  root_check
+  setup_dirs
+  local cmd=$1
+  shift
+  case "$cmd" in
+    boot) boot;;
+    apply) apply_config; status_text;;
+    status) status_text;;
+    scan) resolve_base 2>/dev/null; scan_pkgs;;
+    detect) resolve_base 2>/dev/null; echo "{\"extsd\":\"$EXTSD\",\"intsd\":\"$INTSD\"}";;
+    map)
+      local pkg="" dir="" custom="" move=0 src="" a=""
+      while [ $# -gt 0 ]; do
+        case "$1" in
+          --move) move=1; shift;;
+          --src) [ $# -ge 2 ] && { src=$2; shift 2; } || shift;;
+          --src=*) src=${1#--src=}; shift;;
+          *)
+            if [ -z "$pkg" ]; then pkg=$1
+            elif [ -z "$dir" ]; then dir=$1
+            else custom=$1; fi
+            shift;;
+        esac
+      done
+      [ -z "$pkg" ] || [ -z "$dir" ] && { err "用法: tfc map <pkg> <obb|data|custom|both> [relpath] [--move] [--src <sd>]"; return 1; }
+      if [ "$dir" = both ]; then
+        do_map_both "$pkg" "$move" "$src"
+      else
+        do_map "$pkg" "$dir" "$custom" "$move" "$src"
+      fi
+      ;;
+    unmap)
+      local pkg="" dir="" custom="" restore=0
+      while [ $# -gt 0 ]; do
+        case "$1" in
+          --restore) restore=1; shift;;
+          *)
+            if [ -z "$pkg" ]; then pkg=$1
+            elif [ -z "$dir" ]; then dir=$1
+            else custom=$1; fi
+            shift;;
+        esac
+      done
+      [ -z "$pkg" ] || [ -z "$dir" ] && { err "用法: tfc unmap <pkg> <obb|data|custom|both> [relpath] [--restore]"; return 1; }
+      if [ "$dir" = both ]; then
+        do_unmap_both "$pkg" "$restore"
+      else
+        do_unmap "$pkg" "$dir" "$custom" "$restore"
+      fi
+      ;;
+    serve) serve;;
+    web) web_handle;;
+    token)
+      # bootstrap：生成/显示 Web token（root-only，服务端最先使用；未生成时自动创建）
+      if [ -z "$TOKEN" ]; then
+        TOKEN=$(head -c8 /dev/urandom 2>/dev/null | od -An -tx1 | tr -d ' \n')
+        echo "$TOKEN" > $TOKEN_FILE
+        chmod 600 $TOKEN_FILE 2>/dev/null
+      fi
+      echo "$TOKEN"
+      ;;
+    config)
+      local op=$1 k=$2 v=$3
+      case "$op" in
+        get) config_get "$k";;
+        set) config_set "$k" "$v"; info "$k=$v";;
+      esac
+      ;;
+    uninstall_all) unbind_everything;;
+    *)
+      echo "tf_card — 把 eMMC 应用数据映射到 TF 卡"
+      echo
+      echo "用法:"
+      echo "  tfc boot                        开机挂载+启动 Web"
+      echo "  tfc apply                       应用全部配置"
+      echo "  tfc status                      查看状态"
+      echo "  tfc scan                        扫描有 OBB/data 的包 (JSON)"
+      echo "  tfc detect                      探测外置/内置路径"
+      echo "  tfc map <pkg> <obb|data|custom> [rel] [--move] [--src <sd>]"
+      echo "  tfc unmap <pkg> <obb|data|custom> [rel] [--restore]"
+      echo "  tfc serve                       启动 Web 界面"
+      echo "  tfc token                       显示/生成 Web API token"
+      echo "  tfc config set|get <key> [val]"
+      echo
+      ;;
+  esac
+}
+
+main "$@"
