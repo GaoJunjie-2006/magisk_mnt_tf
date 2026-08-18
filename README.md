@@ -27,7 +27,7 @@ Magisk 模块:把内置 eMMC 的**应用数据**(`Android/obb`、`Android/data`�
 2. **设路径**:外置根点「探测」自动找 `/mnt/media_rw/` 最大分区;内置根默认 `/data/media/0`。保存。
 3. **扫描**:列出所有已装包,有共享数据目录的带占用大小(没有的显示 `-`,映射时自动建目录)。
 4. **映射**:选包 → 选目录(`obb` / 同时映射 both / `data` / **私有目录子目录** / 自定义相对路径)→ 勾选「立即搬数据」(首次建议)→ 映射。
-   - **私有目录映射**(微信/QQ 数据大头):选「私有目录子目录」填 `files`/`cache`。前置:**SELinux permissive**(设置里勾选「SELinux 置为 permissive」)。卡 **exfat 即可**(推荐;ext4 理论上上下文更完整,但 Android 系统不认 ext4 可移动卡、会报「已损坏」,所以实际用 exfat)。不推荐映射 `databases`/`shared_prefs`。
+   - **私有目录映射**(微信/QQ 数据大头):选「私有目录子目录」填 `files`/`cache`,**支持嵌套子目录**如 `files/public`(实测更稳:exfat 不支持尾点文件名如微信 files 根目录里的 `psk.key.`,直接映射 files 根目录复制会报 Invalid argument;改映射 `files/public`、`files/xlog` 等子目录粒度即可)。前置:**SELinux permissive**(设置里勾选「SELinux 置为 permissive」)。卡 **exfat 即可**(推荐;ext4 理论上上下文更完整,但 Android 系统不认 ext4 可移动卡、会报「已损坏」,所以实际用 exfat)。不推荐映射 `databases`/`shared_prefs`。
 5. **应用全部挂载**:重放配置;开机自动执行,无需手动。
 
 - 映射后**重启相关 App** 才生效(正在运行的已缓存路径)。
@@ -80,6 +80,8 @@ src Android/obb/com.x /path/override # 该映射的源覆盖
 | 映射后 App 还是旧数据 | 重启该 App |
 | 私有映射被拒(提示文件系统) | 只支持 ext4/exfat 卡;并确保 SELinux permissive |
 | 私有映射提示「卡损坏」 | 卡是 ext4:Android 不认 ext4 可移动卡,请格式化回 exfat 使用 |
+| 私有目录复制报 `Invalid argument` | exfat 不支持尾点/非法文件名(如 `psk.key.`),改映射更细粒度子目录(如 `files/public`) |
+| root 无法 `ls` 私有挂载点 | 正常:挂载点属主是应用(权限 `drwxrwx--x`),其他进程含 root 只能进入不能列表,防其他 app 窥探;应用本身(属主)读写不受影响 |
 | exfat 权限报错 | 引擎切回 `bindfs` |
 | 挂载失败 | 确认 TF 已挂载、路径存在,看 boot.log |
 
@@ -87,6 +89,7 @@ src Android/obb/com.x /path/override # 该映射的源覆盖
 
 ### v1.10
 - 修复:**私有映射取消 ext4 强制,兼容 exfat 卡**。真机实测 Android vold 把 ext4 可移动卡判为「已损坏」且不挂载——ext4 路线在系统层面走不通,改为 exfat 可用(依赖 permissive + bindfs app 属主,跳过 chcon)
+- 真机验证:微信 `files/public` + `files/xlog`(~145MB)迁移成功,双视图挂载在线,新日志持续落 TF(MM_xxx.xlog 实时增长);发现 exfat 不支持尾点文件名(如 `psk.key.`)导致 files 根目录复制失败 → 建议映射子目录粒度
 
 ### v1.9
 - 新增:**私有目录映射**(应用数据大头,微信 768MB / QQ 222MB 在 `/data/user/0`):`tfc map <pkg> priv <files|cache>`
