@@ -1,6 +1,6 @@
 id=tfcard
 name=TF Card Mapper (eMMC↔TF)
-version=v1.9
-versionCode=109
+version=v1.10
+versionCode=110
 author=gaojunjie
 description=把应用数据（OBB / Android/data / 自定义目录）从内置 eMMC 映射到高性能 TF 卡，把 TF 当第二个 eMMC 用。内置本地 Web 界面：遍历已装包、自定义路径、一键移动+挂载。兼容 Android 14 / Magisk 30。基于 fbind 思路重写。

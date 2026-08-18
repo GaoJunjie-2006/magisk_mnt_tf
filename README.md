@@ -13,7 +13,7 @@ Magisk 模块:把内置 eMMC 的**应用数据**(`Android/obb`、`Android/data`�
 
 ## 安装
 
-1. 传 `tf_card_v1.9.zip` 到手机
+1. 传 `tf_card_v1.10.zip` 到手机
 2. Magisk App → 模块 → 从本地安装
 3. 重启
 
@@ -27,7 +27,7 @@ Magisk 模块:把内置 eMMC 的**应用数据**(`Android/obb`、`Android/data`�
 2. **设路径**:外置根点「探测」自动找 `/mnt/media_rw/` 最大分区;内置根默认 `/data/media/0`。保存。
 3. **扫描**:列出所有已装包,有共享数据目录的带占用大小(没有的显示 `-`,映射时自动建目录)。
 4. **映射**:选包 → 选目录(`obb` / 同时映射 both / `data` / **私有目录子目录** / 自定义相对路径)→ 勾选「立即搬数据」(首次建议)→ 映射。
-   - **私有目录映射**(微信/QQ 数据大头):选「私有目录子目录」填 `files`/`cache`。前置:**SELinux permissive**(设置里勾选「SELinux 置为 permissive」)+ **TF 卡 ext4**(当前 exfat 会被拒绝,提示用 DiskGenius 等格式化)。不推荐映射 `databases`/`shared_prefs`。
+   - **私有目录映射**(微信/QQ 数据大头):选「私有目录子目录」填 `files`/`cache`。前置:**SELinux permissive**(设置里勾选「SELinux 置为 permissive」)。卡 **exfat 即可**(推荐;ext4 理论上上下文更完整,但 Android 系统不认 ext4 可移动卡、会报「已损坏」,所以实际用 exfat)。不推荐映射 `databases`/`shared_prefs`。
 5. **应用全部挂载**:重放配置;开机自动执行,无需手动。
 
 - 映射后**重启相关 App** 才生效(正在运行的已缓存路径)。
@@ -78,16 +78,19 @@ src Android/obb/com.x /path/override # 该映射的源覆盖
 |---|---|
 | Web 打不开 | `su -c 'cat /data/adb/tfcard/logs/boot.log'`;确认 httpd 在监听 8266 |
 | 映射后 App 还是旧数据 | 重启该 App |
-| 私有映射被拒(提示 ext4) | TF 卡非 ext4:用 DiskGenius 等格式化为 ext4;并确保 SELinux permissive |
+| 私有映射被拒(提示文件系统) | 只支持 ext4/exfat 卡;并确保 SELinux permissive |
+| 私有映射提示「卡损坏」 | 卡是 ext4:Android 不认 ext4 可移动卡,请格式化回 exfat 使用 |
 | exfat 权限报错 | 引擎切回 `bindfs` |
 | 挂载失败 | 确认 TF 已挂载、路径存在,看 boot.log |
 
 ## 更新日志
 
+### v1.10
+- 修复:**私有映射取消 ext4 强制,兼容 exfat 卡**。真机实测 Android vold 把 ext4 可移动卡判为「已损坏」且不挂载——ext4 路线在系统层面走不通,改为 exfat 可用(依赖 permissive + bindfs app 属主,跳过 chcon)
+
 ### v1.9
 - 新增:**私有目录映射**(应用数据大头,微信 768MB / QQ 222MB 在 `/data/user/0`):`tfc map <pkg> priv <files|cache>`
-- 前置条件(用户决策):**SELinux permissive** + **TF 卡 ext4**(否则拒绝并提示用 DiskGenius 格式化);exfat 无 xattr,chcon/属主无法恢复
-- 实现:bindfs 以 app 自己的 uid/gid 挂载(非 root:9997),双视图覆盖 `/data/user/0` 与 `/data/data`,挂载前给 TF 源打上 app 的 SELinux 上下文,迁移前自动 force-stop 应用
+- 实现:bindfs 以 app 自己的 uid/gid 挂载(非 root:9997),双视图覆盖 `/data/user/0` 与 `/data/data`,迁移前自动 force-stop 应用
 - Web 界面新增「私有目录子目录」选项与子目录输入框
 - 不推荐映射 `databases`/`shared_prefs`(高频随机 IO + 配置)
 

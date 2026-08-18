@@ -132,7 +132,7 @@
           <option value="obb">Android/obb/包名（推荐，游戏数据）</option>
           <option value="both">同时映射 obb + data（一次搞定）</option>
           <option value="data">Android/data/包名（App 数据，较激进）</option>
-          <option value="priv">私有目录子目录（数据大头，需 permissive + ext4 卡）</option>
+          <option value="priv">私有目录子目录（数据大头，需 permissive；ext4 最佳 / exfat 可用）</option>
           <option value="custom">自定义相对路径</option>
         </select>
       </div>
@@ -145,7 +145,7 @@
     <div class="field" id="rowPriv" style="display:none">
       <label for="inPrivSub">私有目录子目录</label>
       <input id="inPrivSub" type="text" placeholder="files">
-      <p class="hint">映射 <code>/data/user/0/包名/子目录</code>（如 files、cache，微信/QQ 数据大头）到 TF 卡。前置：<b>SELinux permissive</b> + <b>TF 卡 ext4</b>（非 ext4 会被拒绝，请用 DiskGenius 等格式化）。不推荐映射 databases / shared_prefs。</p>
+      <p class="hint">映射 <code>/data/user/0/包名/子目录</code>（如 files、cache，微信/QQ 数据大头）到 TF 卡。前置：<b>SELinux permissive</b>。卡<b> ext4 最佳</b>（可保留 SELinux 上下文），<b>exfat 也可用</b>（Android 不认 ext4 卡会报损坏，实际推荐 exfat）。不推荐映射 databases / shared_prefs。</p>
     </div>
     <div class="field row">
       <div class="half">

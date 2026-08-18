@@ -75,7 +75,7 @@ setup_dirs() {
 #   intsd=/data/media/0                # 自定义内置根
 #   bind_engine=auto|bindfs|mount      # 挂载引擎
 #   permissive=0|1                     # 是否 setenforce 0
-#   map <pkg> <obb|data|custom|priv> [rel]  # 高层映射条目(priv 时 rel=私有子目录,需 permissive + ext4 卡)
+#   map <pkg> <obb|data|custom|priv> [rel]  # 高层映射条目(priv 时 rel=私有子目录,需 permissive; 卡 ext4 最佳, exfat 可用)
 #   bind_mount <src> <dst>             # 原始 bind 条目（高级）
 #   # 注释
 config_get() {
@@ -199,8 +199,11 @@ mount_priv_one() { # pkg sub [dst]  (dst 默认主视图, 双视图可传 /data/
   appuid=$(stat -c %u "/data/user/0/$pkg" 2>/dev/null)
   appgid=$(stat -c %g "/data/user/0/$pkg" 2>/dev/null)
   [ -n "$appuid" ] || { err "取不到 $pkg 的 uid"; return 1; }
-  ctx=$(ls -Zd "$dst" 2>/dev/null | awk '{print $1}')
-  [ -n "$ctx" ] && chcon -R "$ctx" "$src" 2>/dev/null
+  # 仅 ext4 卡可写 xattr: chcon 恢复 SELinux 上下文; exfat 无 xattr, 跳过(依赖 permissive)
+  if [ "$(extsd_fs)" = ext4 ]; then
+    ctx=$(ls -Zd "$dst" 2>/dev/null | awk '{print $1}')
+    [ -n "$ctx" ] && chcon -R "$ctx" "$src" 2>/dev/null
+  fi
   $BINDFS -o nosuid,nodev,noexec,noatime,nonempty \
     -u "$appuid" -g "$appgid" -p a-rwx,ug+rw,ugo+X \
     --create-with-perms=a-rwx,ug+rw,ugo+X --xattr-none \
@@ -345,8 +348,15 @@ do_map() { # pkg dir custom move src_override
     sub=${custom%/}; sub=${sub#/}
     [ -n "$sub" ] || { err "私有映射需指定子目录(如 files / cache / databases 前的数据大头)"; return 1; }
     [ "$(getenforce)" = Permissive ] || { err "私有映射需 SELinux permissive (setenforce 0)"; return 1; }
+    # 卡文件系统: ext4 最佳(有 xattr, 可 chcon 恢复 SELinux 上下文); exfat 也允许
+    # —— 依赖 permissive + bindfs -u appuid 虚拟属主, chcon 非必需。真机实测 Android
+    # vold 会把 ext4 可移动卡判为"已损坏"而不挂载, 故 exfat 是实际可用路径。
     fs=$(extsd_fs)
-    [ "$fs" = ext4 ] || { err "私有映射需 ext4 卡(当前: ${fs:-未识别})——请用 DiskGenius 等工具把 TF 卡格式化为 ext4"; return 1; }
+    case "$fs" in
+      ext4) ;;
+      exfat) warn "exfat 卡: 无 xattr, 跳过 SELinux 上下文(chcon); 依赖 permissive + bindfs app 属主";;
+      *) err "私有映射仅支持 ext4/exfat 卡(当前: ${fs:-未识别}); 其它文件系统会被系统判为损坏"; return 1;;
+    esac
     [ -d "/data/user/0/$pkg" ] || { err "私有目录不存在: /data/user/0/$pkg"; return 1; }
     src="$EXTSD/Android/priv/$pkg/$sub"
     dst="/data/user/0/$pkg/$sub"
